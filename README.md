@@ -1,4 +1,4 @@
-# 🧠 Offline AI Assistant Shell  
+# 🧠 Offline AI Assistant Shell: Secure Local LLM Integration
 > A **secure, offline AI assistant** integrated directly into a custom C shell — powered by [`llama.cpp`](https://github.com/ggerganov/llama.cpp) for local inference.
 
 ---
