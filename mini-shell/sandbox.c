@@ -5,7 +5,9 @@
 #include <sched.h>
 #include <sys/resource.h>
 #include <sys/prctl.h>
+#ifdef HAVE_LIBCAP
 #include <sys/capability.h>
+#endif
 #include <errno.h>
 
 extern void install_seccomp_filter(void);
@@ -26,10 +28,12 @@ void apply_sandbox(void) {
     setrlimit(RLIMIT_AS, &mem_limit);
     
     struct rlimit cpu_limit = { 
-        .rlim_cur = 30,
-        .rlim_max = 30 
+        .rlim_cur = 600,
+        .rlim_max = 600 
     };
-    setrlimit(RLIMIT_CPU, &cpu_limit);
+    if (setrlimit(RLIMIT_CPU, &cpu_limit) == -1) {
+        perror("setrlimit RLIMIT_CPU");
+    }
     
     // 3. Disable core dumps
     struct rlimit core_limit = { .rlim_cur = 0, .rlim_max = 0 };

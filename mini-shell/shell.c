@@ -15,14 +15,55 @@
 // Global AI context
 static ai_context_t g_ai_ctx = {0};
 
+static void report_worker_death(pid_t pid, int status) {
+    if (WIFSIGNALED(status)) {
+        int sig = WTERMSIG(status);
+        fprintf(stderr, "AI worker (PID %d) killed by signal %d (%s)\n",
+                pid, sig, strsignal(sig));
+    } else if (WIFEXITED(status)) {
+        fprintf(stderr, "AI worker (PID %d) exited with status %d\n",
+                pid, WEXITSTATUS(status));
+    } else {
+        fprintf(stderr, "AI worker (PID %d) terminated abnormally\n", pid);
+    }
+}
+
+static void reap_and_report_worker(ai_context_t *ctx) {
+    if (!ctx->is_initialized || ctx->worker_pid <= 0) return;
+
+    int status = 0;
+    pid_t pid = ctx->worker_pid;
+    pid_t w = 0;
+
+    for (int i = 0; i < 20; i++) {
+        w = waitpid(pid, &status, WNOHANG);
+        if (w != 0) break;
+        usleep(10000);
+    }
+
+    if (w == pid) {
+        report_worker_death(pid, status);
+        ctx->worker_pid = 0;
+    } else {
+        fprintf(stderr, "AI worker (PID %d) connection lost; terminating\n", pid);
+    }
+}
+
 void shell_loop() {
     char *line;
     char **args;
     int status = 1;
 
+    signal(SIGPIPE, SIG_IGN);
+
     do {
         printf("mini-shell> ");
+        fflush(stdout);
         line = read_line();
+        if (!line) {
+            printf("\n");
+            break;
+        }
         args = split_line(line);
         status = execute(args);
 
@@ -37,7 +78,10 @@ void shell_loop() {
 char *read_line() {
     char *line = NULL;
     size_t bufsize = 0;
-    getline(&line, &bufsize, stdin);
+    if (getline(&line, &bufsize, stdin) == -1) {
+        free(line);
+        return NULL;
+    }
     return line;
 }
 
@@ -73,6 +117,17 @@ int execute(char **args) {
             if (len > 0) offset += len;
         }
         
+        // Check if existing worker already exited before sending query
+        if (g_ai_ctx.is_initialized && g_ai_ctx.worker_pid > 0) {
+            int wstatus = 0;
+            pid_t w = waitpid(g_ai_ctx.worker_pid, &wstatus, WNOHANG);
+            if (w == g_ai_ctx.worker_pid) {
+                report_worker_death(g_ai_ctx.worker_pid, wstatus);
+                g_ai_ctx.worker_pid = 0;
+                cleanup_ai_context(&g_ai_ctx);
+            }
+        }
+
         // Initialize AI context if needed
         if (!g_ai_ctx.is_initialized) {
             if (init_ai_context(&g_ai_ctx) != 0) {
@@ -92,7 +147,11 @@ int execute(char **args) {
     }
 
     if (strcmp(args[0], "exit") == 0) return 0;
-    if (strcmp(args[0], "clear") == 0) { system("clear"); return 1; }
+    if (strcmp(args[0], "clear") == 0) {
+        int rc = system("clear");
+        (void)rc;
+        return 1;
+    }
     if (strcmp(args[0], "help") == 0) {
         printf("Mini Shell - Built-in Commands:\n");
         printf("  help          - Show this message\n");
@@ -151,8 +210,9 @@ int init_ai_context(ai_context_t *ctx) {
     }
     
     if (ctx->worker_pid == 0) {
-        // Child process: AI worker
-        
+        // Child process: restore default SIGPIPE
+        signal(SIGPIPE, SIG_DFL);
+
         // Redirect stdin/stdout to pipes
         dup2(ctx->pipe_to_worker[0], STDIN_FILENO);
         dup2(ctx->pipe_from_worker[1], STDOUT_FILENO);
@@ -214,7 +274,11 @@ int handle_assist_command(ai_context_t *ctx, const char *prompt) {
     // Send prompt to worker
     ssize_t written = write(ctx->pipe_to_worker[1], safe_prompt, prompt_len + 1);
     if (written == -1) {
-        perror("write to AI worker");
+        if (errno == EPIPE) {
+            reap_and_report_worker(ctx);
+        } else {
+            perror("write to AI worker");
+        }
         cleanup_ai_context(ctx);
         return -1;
     }
@@ -242,7 +306,7 @@ int handle_assist_command(ai_context_t *ctx, const char *prompt) {
     ssize_t bytes_read = read(ctx->pipe_from_worker[0], response, AI_RESPONSE_MAX - 1);
     
     if (bytes_read <= 0) {
-        fprintf(stderr, "AI worker connection lost\n");
+        reap_and_report_worker(ctx);
         cleanup_ai_context(ctx);
         return -1;
     }
