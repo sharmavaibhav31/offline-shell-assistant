@@ -16,6 +16,7 @@ int execute(char **args);
 #define AI_TIMEOUT_SEC 30
 #define AI_WORKER_PATH "./ai_worker"
 #define AI_MODEL_PATH_ENV "HOME"
+#define AI_END_MARKER "__ASSIST_END__"
 
 typedef struct {
     pid_t worker_pid;
@@ -24,6 +25,7 @@ typedef struct {
     bool is_initialized;
 } ai_context_t;
 
+void set_shell_verbose(bool verbose);
 int init_ai_context(ai_context_t *ctx);
 void cleanup_ai_context(ai_context_t *ctx);
 int handle_assist_command(ai_context_t *ctx, const char *prompt);

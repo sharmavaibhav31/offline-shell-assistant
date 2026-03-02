@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <sys/select.h>
 #include <signal.h>
@@ -14,6 +15,11 @@
 
 // Global AI context
 static ai_context_t g_ai_ctx = {0};
+static bool g_verbose = false;
+
+void set_shell_verbose(bool verbose) {
+    g_verbose = verbose;
+}
 
 static void report_worker_death(pid_t pid, int status) {
     if (WIFSIGNALED(status)) {
@@ -216,6 +222,16 @@ int init_ai_context(ai_context_t *ctx) {
         // Redirect stdin/stdout to pipes
         dup2(ctx->pipe_to_worker[0], STDIN_FILENO);
         dup2(ctx->pipe_from_worker[1], STDOUT_FILENO);
+
+        if (!g_verbose) {
+            int devnull = open("/dev/null", O_WRONLY);
+            if (devnull != -1) {
+                dup2(devnull, STDERR_FILENO);
+                if (devnull > STDERR_FILENO) {
+                    close(devnull);
+                }
+            }
+        }
         
         // Close unused pipe ends
         close(ctx->pipe_to_worker[0]);
@@ -224,10 +240,13 @@ int init_ai_context(ai_context_t *ctx) {
         close(ctx->pipe_from_worker[1]);
         
         // Execute AI worker
-        execl(AI_WORKER_PATH, "ai_worker", model_path, NULL);
-        
-        // If exec fails, try echo mode
-        execl(AI_WORKER_PATH, "ai_worker", "--echo", NULL);
+        if (g_verbose) {
+            execl(AI_WORKER_PATH, "ai_worker", "--verbose", model_path, NULL);
+            execl(AI_WORKER_PATH, "ai_worker", "--verbose", "--echo", NULL);
+        } else {
+            execl(AI_WORKER_PATH, "ai_worker", model_path, NULL);
+            execl(AI_WORKER_PATH, "ai_worker", "--echo", NULL);
+        }
         
         // If still fails, exit
         perror("execl ai_worker");
@@ -283,41 +302,72 @@ int handle_assist_command(ai_context_t *ctx, const char *prompt) {
         return -1;
     }
     
-    // Wait for response with timeout
-    fd_set readfds;
-    struct timeval timeout = { .tv_sec = AI_TIMEOUT_SEC, .tv_usec = 0 };
-    
-    FD_ZERO(&readfds);
-    FD_SET(ctx->pipe_from_worker[0], &readfds);
-    
-    int ready = select(ctx->pipe_from_worker[0] + 1, &readfds, NULL, NULL, &timeout);
-    
-    if (ready == -1) {
-        perror("select");
-        cleanup_ai_context(ctx);
-        return -1;
-    } else if (ready == 0) {
-        fprintf(stderr, "AI worker timeout\n");
+    // Read response in a loop until marker line, with bounded buffer and per-read timeout
+    size_t total_len = 0;
+    const size_t marker_len = strlen(AI_END_MARKER);
+    bool marker_found = false;
+    response[0] = '\0';
+
+    while (total_len < AI_RESPONSE_MAX - 1) {
+        fd_set readfds;
+        struct timeval timeout = { .tv_sec = AI_TIMEOUT_SEC, .tv_usec = 0 };
+
+        FD_ZERO(&readfds);
+        FD_SET(ctx->pipe_from_worker[0], &readfds);
+
+        int ready = select(ctx->pipe_from_worker[0] + 1, &readfds, NULL, NULL, &timeout);
+        if (ready == -1) {
+            if (errno == EINTR) continue;
+            perror("select");
+            cleanup_ai_context(ctx);
+            return -1;
+        } else if (ready == 0) {
+            fprintf(stderr, "AI worker timeout\n");
+            cleanup_ai_context(ctx);
+            return -1;
+        }
+
+        ssize_t bytes_read = read(ctx->pipe_from_worker[0],
+                                  response + total_len,
+                                  (AI_RESPONSE_MAX - 1) - total_len);
+        if (bytes_read == -1) {
+            if (errno == EINTR) continue;
+            perror("read from AI worker");
+            reap_and_report_worker(ctx);
+            cleanup_ai_context(ctx);
+            return -1;
+        } else if (bytes_read == 0) {
+            reap_and_report_worker(ctx);
+            cleanup_ai_context(ctx);
+            return -1;
+        }
+
+        total_len += (size_t)bytes_read;
+        response[total_len] = '\0';
+
+        // Check if marker line is at start of buffer or preceded by newline
+        if (strncmp(response, AI_END_MARKER "\n", marker_len + 1) == 0) {
+            response[0] = '\0';
+            marker_found = true;
+            break;
+        }
+        char *marker_pos = strstr(response, "\n" AI_END_MARKER "\n");
+        if (marker_pos != NULL) {
+            *marker_pos = '\0';
+            marker_found = true;
+            break;
+        }
+    }
+
+    if (!marker_found) {
+        fprintf(stderr, "AI response exceeded buffer without end marker; resetting worker\n");
         cleanup_ai_context(ctx);
         return -1;
     }
-    
-    // Read response
-    ssize_t bytes_read = read(ctx->pipe_from_worker[0], response, AI_RESPONSE_MAX - 1);
-    
-    if (bytes_read <= 0) {
-        reap_and_report_worker(ctx);
-        cleanup_ai_context(ctx);
-        return -1;
-    }
-    
-    response[bytes_read] = '\0';
-    
+
     // Display response
-    printf("AI: %s", response);
-    if (response[bytes_read - 1] != '\n') {
-        printf("\n");
-    }
+    printf("AI: %s\n", response);
+    fflush(stdout);
     
     return 0;
 }
