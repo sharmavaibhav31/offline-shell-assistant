@@ -1,17 +1,11 @@
-CC = gcc
-CFLAGS = -Wall
+BUILD_DIR := build
+CMAKE_FLAGS ?= -DCMAKE_BUILD_TYPE=Release
 
-all: mini-shell
+.PHONY: all clean
 
-mini-shell: main.o shell.o
-	$(CC) $(CFLAGS) -o mini-shell main.o shell.o
-
-main.o: main.c shell.h
-	$(CC) $(CFLAGS) -c main.c
-
-shell.o: shell.c shell.h
-	$(CC) $(CFLAGS) -c shell.c
+all:
+	cmake -S . -B $(BUILD_DIR) $(CMAKE_FLAGS)
+	cmake --build $(BUILD_DIR) -j$$(nproc) --target myshell ai_worker
 
 clean:
-	rm -f *.o mini-shell
-
+	rm -rf $(BUILD_DIR)

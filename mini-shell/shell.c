@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <sys/select.h>
@@ -182,8 +183,30 @@ int execute(char **args) {
     return 1;
 }
 
+static int resolve_worker_path(char *out, size_t out_size) {
+    char exe_path[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len > 0) {
+        exe_path[len] = '\0';
+        char *slash = strrchr(exe_path, '/');
+        if (slash != NULL) {
+            *slash = '\0';
+            int written = snprintf(out, out_size, "%s/%s", exe_path, AI_WORKER_NAME);
+            if (written > 0 && (size_t)written < out_size) {
+                return 0;
+            }
+        }
+    }
+    snprintf(out, out_size, "./%s", AI_WORKER_NAME);
+    return -1;
+}
+
 // AI context management
 int init_ai_context(ai_context_t *ctx) {
+    // Resolve worker path next to shell executable
+    char worker_path[PATH_MAX];
+    resolve_worker_path(worker_path, sizeof(worker_path));
+
     // Build model path
     char model_path[512];
     const char *home = getenv("HOME");
@@ -241,11 +264,11 @@ int init_ai_context(ai_context_t *ctx) {
         
         // Execute AI worker
         if (g_verbose) {
-            execl(AI_WORKER_PATH, "ai_worker", "--verbose", model_path, NULL);
-            execl(AI_WORKER_PATH, "ai_worker", "--verbose", "--echo", NULL);
+            execl(worker_path, AI_WORKER_NAME, "--verbose", model_path, NULL);
+            execl(worker_path, AI_WORKER_NAME, "--verbose", "--echo", NULL);
         } else {
-            execl(AI_WORKER_PATH, "ai_worker", model_path, NULL);
-            execl(AI_WORKER_PATH, "ai_worker", "--echo", NULL);
+            execl(worker_path, AI_WORKER_NAME, model_path, NULL);
+            execl(worker_path, AI_WORKER_NAME, "--echo", NULL);
         }
         
         // If still fails, exit

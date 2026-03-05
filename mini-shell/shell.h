@@ -14,7 +14,7 @@ int execute(char **args);
 #define AI_PROMPT_MAX 4096
 #define AI_RESPONSE_MAX 16384
 #define AI_TIMEOUT_SEC 30
-#define AI_WORKER_PATH "./ai_worker"
+#define AI_WORKER_NAME "ai_worker"
 #define AI_MODEL_PATH_ENV "HOME"
 #define AI_END_MARKER "__ASSIST_END__"
 
