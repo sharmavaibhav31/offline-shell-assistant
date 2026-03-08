@@ -1,156 +1,122 @@
-# 🧠 Offline AI Assistant Shell: Secure Local LLM Integration
-> A **secure, offline AI assistant** integrated directly into a custom C shell — powered by [`llama.cpp`](https://github.com/ggerganov/llama.cpp) for local inference.
+# Offline AI Assistant Shell (`myshell`)
+
+> An offline AI assistant integrated into a custom C shell (`myshell`), delegating local LLM inference to a separate worker process (`ai_worker`) over Unix pipes using [`llama.cpp`](https://github.com/ggml-org/llama.cpp).
 
 ---
 
-## 🌱 Project Story  
+## Overview
 
-Around six months ago — I began working on something similar to the Gemini CLI agent but with a different philosophy.  
-
-After switching to **Kali Linux**, I found even simple tasks challenging at first. Like most developers, I often relied on ChatGPT or online resources for help. Then a thought struck me:  
-
-> “If AI assistants can guide us everywhere online, why can’t one live inside the terminal itself?”  
-
-That question led me to explore how an AI model could safely assist users within a **command-line environment**. I quickly realized this came with serious risks — from **data corruption** and **privilege escalation** to **privacy breaches** and **system compromise**.  
-
-Instead of abandoning the idea, I decided to design it **responsibly**, focusing on **security-first principles**:  
-- Studying **AI agent behavior** inside operating systems  
-- Implementing **sandboxing** and **syscall filtering (Seccomp)**  
-- Ensuring **fully offline**, **local inference** for data privacy  
-
----
----
-
-## 📺 Demo Video
-
-Check out a quick demonstration of the offline AI assistant in action.
-
-[![Watch the Demo: Offline AI Assistant Shell](https://img.youtube.com/vi/nCAE7SovqPM/maxresdefault.jpg)](https://www.youtube.com/watch?v=nCAE7SovqPM)
+The **Offline AI Assistant Shell** splits interactive command execution from LLM inference:
+- **`myshell` (`main.c`, `shell.c`)**: Parses commands, executes standard shell commands, manages the worker lifecycle (`fork`/`execl`, pipe IPC, bounded reads with timeouts, `waitpid` exit/signal reporting, `assist-reset`), and passes queries to `ai_worker`.
+- **`ai_worker` (`ai_worker.c`, `sandbox.c`, `seccomp_filter.c`)**: Runs TinyLlama-1.1B-Chat locally via `llama.cpp` (or falls back to `--echo` mode if no GGUF model is present), applies Linux process limits and privilege reduction, and returns responses framed with `__ASSIST_END__`.
 
 ---
 
-## ⚙️ Tech Stack & Security Architecture  
+## Architecture
 
-| Component | Purpose |
-|------------|----------|
-| **C** | System-level shell implementation |
-| **CMake** | Build automation |
-| **llama.cpp** | Efficient local inference on CPU |
-| **TinyLlama-1.1B-Chat** | Lightweight conversational LLM |
-| **Seccomp (Secure Computing Mode)** | Syscall filtering and sandboxing |
-
-This architecture ensures the assistant operates **entirely offline**, in a **restricted and isolated** environment — minimizing system exposure while preserving performance and privacy.
+```text
++-----------------------+       pipe_to_worker        +---------------------------+
+| myshell (Parent)      | --------------------------> | ai_worker (Child Process) |
+| - Command loop & exec |                             | - Resource limits         |
+| - Bounded timeout I/O | <-------------------------- | - Capability drop         |
+| - Respawns on crash   |       pipe_from_worker      | - llama.cpp inference     |
++-----------------------+                             +---------------------------+
+```
 
 ---
 
-## 🧠 How It Works  
+## Prerequisites
 
-Once launched, the shell initializes a **sandboxed AI worker** that processes natural language queries locally.  
+```bash
+sudo apt-get install build-essential cmake libcap-dev
+```
 
-mini-shell> assist what is recursion
-The assistant interprets your question, generates a conversational response, and displays it — without internet access or external APIs.
-Every system call is filtered through Seccomp, preventing unsafe or unauthorized operations.
+---
 
-### 🔐 Security Design
-Layer	Mechanism	Purpose   
-Seccomp	Syscall whitelist	Restrict risky system operations   
-Rlimits	Resource caps	Limit CPU & memory usage    
-Namespaces	Process & FS isolation	Contain execution context   
-Capability Dropping	Kernel privilege reduction	Prevent escalations   
+## Installation & Build
 
-These combined mechanisms ensure strong process isolation, privacy, and fail-safe execution.
+### 1. Clone the repository (with `llama.cpp` submodule)
 
-⚡ Installation
-🧩 Prerequisites
-sudo apt-get install build-essential cmake libcap-dev valgrind  
+```bash
+git clone --recurse-submodules https://github.com/sharmavaibhav31/offline-shell-assistant.git
+cd offline-shell-assistant/mini-shell
+```
 
-1️⃣ Clone & Build llama.cpp
+If you already cloned without `--recurse-submodules`:
 
-cd ~   
-git clone https://github.com/ggerganov/llama.cpp.git  
-cd llama.cpp  
-rm -rf build && mkdir build && cd build  
-cmake .. -DBUILD_SHARED_LIBS=OFF  
-make llama -j$(nproc)  
-  
+```bash
+git submodule update --init --recursive
+```
 
-2️⃣ Download Model
+### 2. Download the Model
 
-mkdir -p ~/.assist_ai  
-cd ~/.assist_ai  
-wget https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -O model.gguf  
-md5sum model.gguf > model.md5  
+```bash
+mkdir -p ~/.assist_ai
+wget https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -O ~/.assist_ai/model.gguf
+md5sum ~/.assist_ai/model.gguf > ~/.assist_ai/model.md5
+```
 
+### 3. Build `myshell` and `ai_worker`
 
-3️⃣ Build the Shell
+Using the Makefile wrapper (calls CMake):
 
-cd ~/Documents/C_project/mini-shell    
-mkdir build && cd build    
-cmake ..    
-make -j$(nproc)    
+```bash
+cd mini-shell
+make
+```
 
+Or directly with CMake (optionally pointing to an existing `llama.cpp` checkout via `-DLLAMA_CPP_DIR`):
 
-💡 Usage
-Action	Command  
-Run shell	./myshell  
-Ask the AI assistant	mini-shell> assist what is recursion 
-Reset the AI worker	mini-shell> assist-reset  
-Exit the shell	mini-shell> exit  
+```bash
+cd mini-shell
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+# Optional external llama.cpp:
+# cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CPP_DIR=/path/to/llama.cpp
+cmake --build build -j$(nproc) --target myshell ai_worker
+```
 
+Both `myshell` and `ai_worker` are built into `mini-shell/build/`. `myshell` locates `ai_worker` next to its own executable via `/proc/self/exe`, so it can be launched from any working directory.
 
-🧪 Testing  
+---
 
-| Test	| Command	 | Purpose | 
-|------------|----------|------------|
-| Run test suite	| ./test_assist.sh	| Functional testing |  
-| Verify model integrity	| ./verify_model.sh	| MD5 hash check |  
-| Stress test |	./stress_test.sh |	Load/stability validation  |
-| Security audit	| strace -f ./myshell	| Syscall inspection  |
+## Quick Start & Usage
 
-⚠️ Troubleshooting
-| Problem	| Possible Cause | Solution |
-|------------|----------|--------------|
-| Worker fails to start	|                             Missing model file	        |                  Ensure ~/.assist_ai/model.gguf exists |
-| Timeout errors	        |                           Context too large	             |             Reduce n_ctx or use smaller model |
-| Namespace errors	       |                          Kernel limitations	            |              Fallback disables isolation |
-| Seccomp kills worker	   |                          Blocked syscall	                |            Update seccomp_filter.c whitelist |
+Run the shell:
 
+```bash
+./mini-shell/build/myshell
+```
 
-📊 Performance (CPU-Only)
-| Metric | Value | Notes |
-|------------|----------|--------------|
-| First query | ~2–3 s | Includes model load time |
-| Subsequent queries | ~1–2 s | Reuses context |
-| Memory usage | ~1–1.5 GB | Depends on model |
-| Token speed |10–20 tokens/s | CPU-dependent |
+Pass `--verbose` (or `-v`) to keep worker stderr and `llama.cpp` diagnostics visible:
 
+```bash
+./mini-shell/build/myshell --verbose
+```
 
-🧩 Future Scope
-This project represents an early exploration into secure, agentic AI at the system level.
-In the next phase, I aim to:
+If `~/.assist_ai/model.gguf` is missing, `ai_worker` automatically falls back to echo mode (`AI: Echo: <prompt>`).
 
-🔁 Fine-tune the AI assistant for contextual awareness and adaptive command guidance  
-🧠 Transform the shell into an agentic CLI, capable of decision-making within secure bounds  
-🧩 Collaborate with mentors or security experts to enhance kernel-level safety and inference reliability  
-🔒 Explore reinforcement-based task execution within isolated sandboxes  
+| Action | Command |
+|--------|---------|
+| Ask the AI assistant | `mini-shell> assist what is 2+2` |
+| Multi-word prompt | `mini-shell> assist explain the difference between RAM and ROM` |
+| Restart the AI worker | `mini-shell> assist-reset` |
+| Show built-in commands | `mini-shell> help` |
+| Clear screen | `mini-shell> clear` |
+| Exit the shell | `mini-shell> exit` |
 
-I believe the fusion of Machine Learning and Cybersecurity can define the next generation of secure AI agents, and this project is my step toward that direction.
+---
 
-🛡️ Design Philosophy
-“Local intelligence should be private, safe, and performant.”  
-This shell demonstrates how AI inference can be embedded directly into system utilities while preserving offline privacy and integrity — valuable for embedded, defense, and research systems.  
+## Testing
 
+```bash
+cd mini-shell
+./test_assist.sh
+./stress_test.sh
+./verify_model.sh
+```
 
-📜 License
-Licensed under the MIT License — see the LICENSE file for details.  
+---
 
-🤝 Contributing  
-Contributions and security improvements are welcome!  
-Please open an issue before submitting major changes.  
+## License
 
-🙏 Acknowledgments  
-llama.cpp — Local LLM engine  
-TheBloke — Model provider    
-Research inspirations from secure AI sandboxing and trusted computing  
-
-<p align="center"><sub>🧠 Built for privacy. Designed for performance. Secured by sandboxing.</sub></p> 
+MIT License.
