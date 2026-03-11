@@ -6,22 +6,64 @@
 
 ## Overview
 
-The **Offline AI Assistant Shell** splits interactive command execution from LLM inference:
-- **`myshell` (`main.c`, `shell.c`)**: Parses commands, executes standard shell commands, manages the worker lifecycle (`fork`/`execl`, pipe IPC, bounded reads with timeouts, `waitpid` exit/signal reporting, `assist-reset`), and passes queries to `ai_worker`.
-- **`ai_worker` (`ai_worker.c`, `sandbox.c`, `seccomp_filter.c`)**: Runs TinyLlama-1.1B-Chat locally via `llama.cpp` (or falls back to `--echo` mode if no GGUF model is present), applies Linux process limits and privilege reduction, and returns responses framed with `__ASSIST_END__`.
+The **Offline AI Assistant Shell** separates interactive shell execution from local LLM inference across two processes:
+
+- **`myshell` (`mini-shell/main.c`, `mini-shell/shell.c`, `mini-shell/shell.h`)**: Interactive shell loop that runs standard commands via `fork()`/`execvp()`, spawns `ai_worker` via `fork()`/`execl()` (located next to `myshell` via `/proc/self/exe`), communicates over unidirectional pipes, reads replies until the `__ASSIST_END__` marker with bounded buffers and per-read `select()` timeouts, reports worker crashes/signals via `waitpid()` (`WIFSIGNALED`/`WTERMSIG`), and respawns the worker on the next `assist` query.
+- **`ai_worker` (`mini-shell/ai_worker.c`, `mini-shell/sandbox.c`, `mini-shell/seccomp_filter.c`)**: Runs TinyLlama-1.1B-Chat locally on CPU via `llama.cpp` (or falls back to `--echo` mode if no accessible GGUF model is present), formats queries with the TinyLlama chat template (`<|system|>...<|user|>...<|assistant|>`), clears KV cache memory between queries (`llama_memory_clear(llama_get_memory(ctx), true)`), silences `llama.cpp` logs unless `--verbose` is given, and applies OS-level process restrictions before loading the model.
 
 ---
 
 ## Architecture
 
 ```text
-+-----------------------+       pipe_to_worker        +---------------------------+
-| myshell (Parent)      | --------------------------> | ai_worker (Child Process) |
-| - Command loop & exec |                             | - Resource limits         |
-| - Bounded timeout I/O | <-------------------------- | - Capability drop         |
-| - Respawns on crash   |       pipe_from_worker      | - llama.cpp inference     |
-+-----------------------+                             +---------------------------+
++-----------------------------------+   pipe_to_worker    +------------------------------------+
+| myshell (Parent / Trusted Shell)  | ------------------> | ai_worker (Child / Worker Process) |
+| - Command parsing & job execution |                     | - setrlimit() (AS, CPU, CORE)      |
+| - Bounded timeout pipe reads      | <------------------ | - capset() + PR_SET_NO_NEW_PRIVS   |
+| - Respawns worker & reports exits |  pipe_from_worker   | - llama.cpp inference / echo mode  |
++-----------------------------------+                     +------------------------------------+
 ```
+
+---
+
+## Security & Isolation Status
+
+| Mechanism | Status | Details & Verification |
+|---|---|---|
+| `rlimits` | **Working** | `sandbox.c` sets `RLIMIT_AS` (2 GiB), `RLIMIT_CPU` (600 s cumulative CPU time), and `RLIMIT_CORE` (0 bytes, disables core dumps) via `setrlimit()`. |
+| `capability dropping` | **Working** | `sandbox.c` clears effective/permitted/inheritable capabilities via `capset()` (or `libcap` when `HAVE_LIBCAP` is defined) and sets `PR_SET_NO_NEW_PRIVS = 1`. Verified via `/proc/self/status` inside `ai_worker`: `CapEff: 0000000000000000`, `CapPrm: 0000000000000000`, `NoNewPrivs: 1`. |
+| `seccomp` | **Not enabled** | `seccomp_filter.c` defines a BPF syscall whitelist, but `install_seccomp_filter()` is not called in `sandbox.c`. |
+| `namespaces` | **Not working** | `unshare(CLONE_NEWNS | CLONE_NEWPID)` fails with `EPERM` (`Operation not permitted`) when run as a normal unprivileged user without `CAP_SYS_ADMIN` or user-namespace setup. |
+| `model integrity check` | **Partial** | `mini-shell/verify_model.sh` manually checks/writes `~/.assist_ai/model.md5` with `md5sum`, but neither `myshell` nor `ai_worker` checks model hashes at startup, and MD5 is non-cryptographic. |
+
+---
+
+## Threat Model
+
+- **What the worker (`ai_worker`) can do:**
+  - Read the model file (`~/.assist_ai/model.gguf`), standard shared libraries, and `/proc/self/status` as the invoking user.
+  - Read prompts from `stdin` (pipe from `myshell`) and write inference output to `stdout` (pipe to `myshell`).
+  - Allocate up to 2 GiB of virtual address space (`RLIMIT_AS`) and consume up to 600 s of cumulative CPU time (`RLIMIT_CPU`) before termination.
+  - Because `namespaces` fail as a non-root user and `seccomp` is not enabled by default, `ai_worker` still shares the user's filesystem, network, and UID permissions at the kernel boundary.
+- **What the worker (`ai_worker`) cannot do:**
+  - Elevate privileges via setuid binaries or file capabilities (`CapEff = 0`, `PR_SET_NO_NEW_PRIVS = 1`).
+  - Produce core dumps (`RLIMIT_CORE = 0`).
+  - Execute arbitrary shell commands directly in the user's shell environment (it cannot mutate `myshell` variables/state or run `fork()`/`execvp()` inside `myshell`; it only returns text over the pipe).
+  - Hang `myshell` indefinitely (each pipe read has a 30 s `select()` timeout and a 16 KiB response buffer limit).
+- **What only the shell (`myshell`) controls:**
+  - Interactive prompt parsing, built-in commands (`assist`, `assist-reset`, `help`, `clear`, `exit`), and `fork()`/`execvp()` of external OS commands.
+  - Worker lifecycle management: spawning `ai_worker`, redirecting worker `stderr` to `/dev/null` (unless `--verbose`), detecting worker crashes/signals via `waitpid()`, and respawning on subsequent `assist` commands.
+
+---
+
+## Known Limitations
+
+- **No active syscall/filesystem sandbox for unprivileged users:** Because `unshare()` requires privileges (`EPERM`) and seccomp is disabled, a compromised worker running under your UID has normal user-level filesystem and syscall access.
+- **Cumulative CPU limit (`RLIMIT_CPU = 600` s):** Prevents infinite runaway loops, meaning a single long-lived worker process will eventually hit the 600 s CPU cap after heavy sustained usage (after which `myshell` reports the signal and respawns a fresh worker on the next `assist` query).
+- **Single-turn stateless queries:** Context memory (`llama_memory_clear`) is cleared before every query, so `ai_worker` does not retain multi-turn conversation history across `assist` calls.
+- **Small model accuracy & context:** TinyLlama-1.1B-Chat Q4_K_M is a 1.1B parameter quantized model; answers are concise but can be factually imprecise or repetitive on complex prompts.
+- **Response size & timeout caps:** `myshell` caps each worker reply at 16,384 bytes (`AI_RESPONSE_MAX`) and times out if a single pipe read stalls for more than 30 s (`AI_TIMEOUT_SEC`).
+- **Linux-specific:** Uses `/proc/self/exe`, `/proc/self/status`, `prctl()`, `capset()`, and Linux `rlimit` semantics.
 
 ---
 
@@ -30,6 +72,8 @@ The **Offline AI Assistant Shell** splits interactive command execution from LLM
 ```bash
 sudo apt-get install build-essential cmake libcap-dev
 ```
+
+*(Note: `libcap-dev` is optional; if absent, `sandbox.c` falls back to the Linux `SYS_capset` syscall directly.)*
 
 ---
 
@@ -42,7 +86,7 @@ git clone --recurse-submodules https://github.com/sharmavaibhav31/offline-shell-
 cd offline-shell-assistant/mini-shell
 ```
 
-If you already cloned without `--recurse-submodules`:
+If already cloned without submodules:
 
 ```bash
 git submodule update --init --recursive
@@ -58,14 +102,14 @@ md5sum ~/.assist_ai/model.gguf > ~/.assist_ai/model.md5
 
 ### 3. Build `myshell` and `ai_worker`
 
-Using the Makefile wrapper (calls CMake):
+Using the Makefile wrapper (invokes CMake):
 
 ```bash
 cd mini-shell
 make
 ```
 
-Or directly with CMake (optionally pointing to an existing `llama.cpp` checkout via `-DLLAMA_CPP_DIR`):
+Or directly with CMake (optionally passing an existing `llama.cpp` checkout via `-DLLAMA_CPP_DIR`):
 
 ```bash
 cd mini-shell
@@ -75,7 +119,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc) --target myshell ai_worker
 ```
 
-Both `myshell` and `ai_worker` are built into `mini-shell/build/`. `myshell` locates `ai_worker` next to its own executable via `/proc/self/exe`, so it can be launched from any working directory.
+Both `myshell` and `ai_worker` are output into `mini-shell/build/`. `myshell` resolves `ai_worker` relative to its own binary path via `/proc/self/exe`, so it works from any working directory.
 
 ---
 
@@ -87,16 +131,16 @@ Run the shell:
 ./mini-shell/build/myshell
 ```
 
-Pass `--verbose` (or `-v`) to keep worker stderr and `llama.cpp` diagnostics visible:
+Pass `--verbose` (or `-v`) to preserve worker `stderr` and `llama.cpp` logs:
 
 ```bash
 ./mini-shell/build/myshell --verbose
 ```
 
-If `~/.assist_ai/model.gguf` is missing, `ai_worker` automatically falls back to echo mode (`AI: Echo: <prompt>`).
+If `~/.assist_ai/model.gguf` is missing, `ai_worker` falls back to echo mode (`AI: Echo: <prompt>`).
 
 | Action | Command |
-|--------|---------|
+|---|---|
 | Ask the AI assistant | `mini-shell> assist what is 2+2` |
 | Multi-word prompt | `mini-shell> assist explain the difference between RAM and ROM` |
 | Restart the AI worker | `mini-shell> assist-reset` |
