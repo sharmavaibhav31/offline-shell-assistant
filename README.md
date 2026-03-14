@@ -150,6 +150,19 @@ If `~/.assist_ai/model.gguf` is missing, `ai_worker` falls back to echo mode (`A
 
 ---
 
+## Performance (Measured)
+
+Measured on `Intel(R) Core(TM) i3-1005G1 CPU @ 1.20GHz` (2 cores / 4 threads, `18 GiB` RAM) running `TinyLlama-1.1B-Chat-v1.0` Q4_K_M (`636.18 MiB`, `n_threads = 2`). See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for raw commands and full data.
+
+| Metric | Measured Value | Notes |
+|---|---|---|
+| Token generation (`llama-bench` `tg128`, `-t 2`) | `27.38 ± 1.08 tokens/s` | `pp128`: `86.44 ± 6.58 tokens/s` |
+| Peak memory (`/usr/bin/time -v`) | `1,186,008 KB` (~`1.13 GiB`) | Max RSS across 5 queries |
+| First query latency | `2.088 s` | Includes worker spawn, model load, and reply |
+| Subsequent query latency | `0.963 s` – `10.936 s` | Depends on reply length (up to 256 tokens) |
+
+---
+
 ## Testing
 
 ```bash
