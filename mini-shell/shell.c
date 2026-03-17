@@ -94,12 +94,26 @@ char *read_line() {
 
 char **split_line(char *line) {
     int bufsize = MAX_ARGS, position = 0;
-    char **tokens = malloc(bufsize * sizeof(char*));
+    char **tokens = malloc((size_t)bufsize * sizeof(char*));
+    if (!tokens) {
+        perror("malloc");
+        exit(EXIT_FAILURE);
+    }
     char *token;
 
     token = strtok(line, DELIM);
     while (token != NULL) {
         tokens[position++] = token;
+        if (position >= bufsize) {
+            bufsize *= 2;
+            char **tmp = realloc(tokens, (size_t)bufsize * sizeof(char*));
+            if (!tmp) {
+                free(tokens);
+                perror("realloc");
+                exit(EXIT_FAILURE);
+            }
+            tokens = tmp;
+        }
         token = strtok(NULL, DELIM);
     }
     tokens[position] = NULL;
