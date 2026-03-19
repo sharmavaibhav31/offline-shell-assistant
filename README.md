@@ -32,7 +32,7 @@ The **Offline AI Assistant Shell** separates interactive shell execution from lo
 |---|---|---|
 | `rlimits` | **Working** | `sandbox.c` sets `RLIMIT_AS` (2 GiB), `RLIMIT_CPU` (600 s cumulative CPU time), and `RLIMIT_CORE` (0 bytes, disables core dumps) via `setrlimit()`. |
 | `capability dropping` | **Working** | `sandbox.c` clears effective/permitted/inheritable capabilities via `capset()` (or `libcap` when `HAVE_LIBCAP` is defined) and sets `PR_SET_NO_NEW_PRIVS = 1`. Verified via `/proc/self/status` inside `ai_worker`: `CapEff: 0000000000000000`, `CapPrm: 0000000000000000`, `NoNewPrivs: 1`. |
-| `seccomp` | **Not enabled** | `seccomp_filter.c` defines a BPF syscall whitelist, but `install_seccomp_filter()` is not called in `sandbox.c`. |
+| `seccomp` | **Working** | `seccomp_filter.c` installs a BPF `SECCOMP_RET_KILL_PROCESS` syscall whitelist (`install_seccomp_filter`) after `llama_init_from_model()` (and before `echo_worker()`), allowing `strace -f`-audited runtime/threading syscalls (`read`, `write`, `mmap`, `munmap`, `mprotect`, `madvise`, `brk`, `futex`, `clone3`, `clone`, `set_robust_list`, `rseq`, `rt_sig*`, `exit*`, etc.) and blocking `openat`, `execve`, `socket`, etc. Verified `Seccomp: 2` and 10/10 queries in kill mode. |
 | `namespaces` | **Not working** | `unshare(CLONE_NEWNS | CLONE_NEWPID)` fails with `EPERM` (`Operation not permitted`) when run as a normal unprivileged user without `CAP_SYS_ADMIN` or user-namespace setup. |
 | `model integrity check` | **Partial** | `mini-shell/verify_model.sh` manually checks/writes `~/.assist_ai/model.md5` with `md5sum`, but neither `myshell` nor `ai_worker` checks model hashes at startup, and MD5 is non-cryptographic. |
 
@@ -41,15 +41,14 @@ The **Offline AI Assistant Shell** separates interactive shell execution from lo
 ## Threat Model
 
 - **What the worker (`ai_worker`) can do:**
-  - Read the model file (`~/.assist_ai/model.gguf`), standard shared libraries, and `/proc/self/status` as the invoking user.
-  - Read prompts from `stdin` (pipe from `myshell`) and write inference output to `stdout` (pipe to `myshell`).
+  - During startup (before post-load seccomp), read `~/.assist_ai/model.gguf`, load shared libraries, and read `/proc/self/status` as the invoking user.
+  - After model and context load, read prompts from `stdin` (pipe from `myshell`), run multi-threaded CPU inference (`clone3`/`futex`/`mmap`), and write output to `stdout` (pipe to `myshell`).
   - Allocate up to 2 GiB of virtual address space (`RLIMIT_AS`) and consume up to 600 s of cumulative CPU time (`RLIMIT_CPU`) before termination.
-  - Because `namespaces` fail as a non-root user and `seccomp` is not enabled by default, `ai_worker` still shares the user's filesystem, network, and UID permissions at the kernel boundary.
 - **What the worker (`ai_worker`) cannot do:**
+  - Open new files (`openat`), spawn external programs (`execve`), or open network sockets (`socket`/`connect`) once the post-load seccomp filter is active (`Seccomp: 2`, `SECCOMP_RET_KILL_PROCESS`).
   - Elevate privileges via setuid binaries or file capabilities (`CapEff = 0`, `PR_SET_NO_NEW_PRIVS = 1`).
   - Produce core dumps (`RLIMIT_CORE = 0`).
-  - Execute arbitrary shell commands directly in the user's shell environment (it cannot mutate `myshell` variables/state or run `fork()`/`execvp()` inside `myshell`; it only returns text over the pipe).
-  - Hang `myshell` indefinitely (each pipe read has a 30 s `select()` timeout and a 16 KiB response buffer limit).
+  - Execute arbitrary shell commands directly in `myshell` or hang `myshell` indefinitely (30 s `select()` timeout per read, 16 KiB reply buffer limit).
 - **What only the shell (`myshell`) controls:**
   - Interactive prompt parsing, built-in commands (`assist`, `assist-reset`, `help`, `clear`, `exit`), and `fork()`/`execvp()` of external OS commands.
   - Worker lifecycle management: spawning `ai_worker`, redirecting worker `stderr` to `/dev/null` (unless `--verbose`), detecting worker crashes/signals via `waitpid()`, and respawning on subsequent `assist` commands.
@@ -58,7 +57,8 @@ The **Offline AI Assistant Shell** separates interactive shell execution from lo
 
 ## Known Limitations
 
-- **No active syscall/filesystem sandbox for unprivileged users:** Because `unshare()` requires privileges (`EPERM`) and seccomp is disabled, a compromised worker running under your UID has normal user-level filesystem and syscall access.
+- **No namespace isolation for unprivileged users:** `unshare(CLONE_NEWNS | CLONE_NEWPID)` fails with `EPERM` when run as a normal user without `CAP_SYS_ADMIN` or user-namespace setup.
+- **Post-load seccomp scope:** Seccomp is installed after `llama_init_from_model()` opens the model and `/proc/self/status`, and `clone3` remains whitelisted so `llama.cpp` can spawn CPU worker threads during inference. Set `ASSIST_SECCOMP_LOG=1` to run the filter in `SECCOMP_RET_LOG` mode while debugging.
 - **Cumulative CPU limit (`RLIMIT_CPU = 600` s):** Prevents infinite runaway loops, meaning a single long-lived worker process will eventually hit the 600 s CPU cap after heavy sustained usage (after which `myshell` reports the signal and respawns a fresh worker on the next `assist` query).
 - **Single-turn stateless queries:** Context memory (`llama_memory_clear`) is cleared before every query, so `ai_worker` does not retain multi-turn conversation history across `assist` calls.
 - **Small model accuracy & context:** TinyLlama-1.1B-Chat Q4_K_M is a 1.1B parameter quantized model; answers are concise but can be factually imprecise or repetitive on complex prompts.

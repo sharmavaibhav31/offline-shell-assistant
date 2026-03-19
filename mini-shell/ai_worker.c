@@ -9,6 +9,7 @@
 #define MAX_RESPONSE_LEN 16384
 
 extern void apply_sandbox(void);
+extern void apply_post_load_seccomp(void);
 
 static void send_reply(const char *text, int len) {
     if (len > 0) {
@@ -96,6 +97,9 @@ int llama_worker(const char *model_path, bool verbose) {
         fprintf(stderr, "Failed to create context\n");
         return 1;
     }
+
+    // Enable seccomp after model and context are loaded
+    apply_post_load_seccomp();
 
     char prompt[MAX_PROMPT_LEN];
     char formatted_prompt[MAX_PROMPT_LEN + 256];
@@ -243,18 +247,21 @@ int main(int argc, char **argv) {
 
     if (echo_mode) {
         apply_sandbox();
+        apply_post_load_seccomp();
         return echo_worker();
     }
 
     if (model_path == NULL) {
         fprintf(stderr, "No model path provided, using echo mode\n");
         apply_sandbox();
+        apply_post_load_seccomp();
         return echo_worker();
     }
 
     if (access(model_path, R_OK) != 0) {
         fprintf(stderr, "Model file not accessible, using echo mode\n");
         apply_sandbox();
+        apply_post_load_seccomp();
         return echo_worker();
     }
 
@@ -263,6 +270,7 @@ int main(int argc, char **argv) {
 #else
     fprintf(stderr, "Compiled without llama.cpp support, using echo mode\n");
     apply_sandbox();
+    apply_post_load_seccomp();
     return echo_worker();
 #endif
 }

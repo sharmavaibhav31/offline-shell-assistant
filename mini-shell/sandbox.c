@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 #include <sched.h>
@@ -14,7 +15,7 @@
 #include <sys/capability.h>
 #endif
 
-extern void install_seccomp_filter(void);
+extern void install_seccomp_filter(bool log_only);
 
 static void log_proc_cap_status(void) {
     FILE *f = fopen("/proc/self/status", "r");
@@ -96,6 +97,14 @@ void apply_sandbox(void) {
     drop_capabilities();
     log_proc_cap_status();
 
-    // 6. Seccomp currently disabled by default (see Step 8 / ASSIST_SECCOMP)
-    fprintf(stderr, "Sandbox applied (seccomp not enabled)\n");
+    // 6. Seccomp is installed after model and context load via apply_post_load_seccomp()
+    fprintf(stderr, "Sandbox pre-load applied (rlimits + caps)\n");
+}
+
+void apply_post_load_seccomp(void) {
+    const char *log_env = getenv("ASSIST_SECCOMP_LOG");
+    bool log_only = (log_env != NULL && strcmp(log_env, "1") == 0);
+    install_seccomp_filter(log_only);
+    fprintf(stderr, "[sandbox] Seccomp filter enabled (%s mode)\n",
+            log_only ? "log" : "kill");
 }
