@@ -1,57 +1,110 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
 #include <unistd.h>
 #include <sched.h>
 #include <sys/resource.h>
 #include <sys/prctl.h>
-#include <sys/capability.h>
+#include <sys/syscall.h>
+#include <linux/capability.h>
 #include <errno.h>
 
-extern void install_seccomp_filter(void);
+#ifdef HAVE_LIBCAP
+#include <sys/capability.h>
+#endif
 
-void apply_sandbox(void) {
-    // 1. Try to create new namespaces
-    if (unshare(CLONE_NEWNS | CLONE_NEWPID) == -1) {
-        if (errno == EPERM) {
-            fprintf(stderr, "Warning: namespace isolation unavailable (EPERM)\n");
+extern void install_seccomp_filter(bool log_only);
+
+static void log_proc_cap_status(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) {
+        perror("fopen /proc/self/status");
+        return;
+    }
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "CapEff:", 7) == 0 ||
+            strncmp(line, "CapPrm:", 7) == 0 ||
+            strncmp(line, "NoNewPrivs:", 11) == 0) {
+            fprintf(stderr, "[sandbox] %s", line);
         }
     }
-    
+    fclose(f);
+}
+
+static void drop_capabilities(void) {
+#ifdef HAVE_LIBCAP
+    cap_t caps = cap_init();
+    if (caps) {
+        if (cap_set_proc(caps) == -1) {
+            perror("cap_set_proc");
+        }
+        cap_free(caps);
+    }
+#else
+    struct __user_cap_header_struct hdr = {
+        .version = _LINUX_CAPABILITY_VERSION_3,
+        .pid = 0
+    };
+    struct __user_cap_data_struct data[2];
+    memset(data, 0, sizeof(data));
+    if (syscall(SYS_capset, &hdr, data) == -1) {
+        perror("capset");
+    }
+#endif
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1) {
+        perror("prctl PR_SET_NO_NEW_PRIVS");
+    }
+}
+
+void apply_sandbox(void) {
+    // 1. Attempt namespace isolation (requires CAP_SYS_ADMIN / unprivileged userns)
+    if (unshare(CLONE_NEWNS | CLONE_NEWPID) == -1) {
+        fprintf(stderr, "Warning: namespace isolation unavailable (%s)\n", strerror(errno));
+    }
+
     // 2. Set resource limits
-    struct rlimit mem_limit = { 
+    struct rlimit mem_limit = {
         .rlim_cur = 2UL * 1024 * 1024 * 1024,
-        .rlim_max = 2UL * 1024 * 1024 * 1024 
+        .rlim_max = 2UL * 1024 * 1024 * 1024
     };
-    setrlimit(RLIMIT_AS, &mem_limit);
-    
-    struct rlimit cpu_limit = { 
-        .rlim_cur = 30,
-        .rlim_max = 30 
+    if (setrlimit(RLIMIT_AS, &mem_limit) == -1) {
+        perror("setrlimit RLIMIT_AS");
+    }
+
+    struct rlimit cpu_limit = {
+        .rlim_cur = 600,
+        .rlim_max = 600
     };
-    setrlimit(RLIMIT_CPU, &cpu_limit);
-    
+    if (setrlimit(RLIMIT_CPU, &cpu_limit) == -1) {
+        perror("setrlimit RLIMIT_CPU");
+    }
+
     // 3. Disable core dumps
     struct rlimit core_limit = { .rlim_cur = 0, .rlim_max = 0 };
-    setrlimit(RLIMIT_CORE, &core_limit);
-    
-    // 4. Close all file descriptors except stdin/stdout/stderr
+    if (setrlimit(RLIMIT_CORE, &core_limit) == -1) {
+        perror("setrlimit RLIMIT_CORE");
+    }
+
+    // 4. Close inherited file descriptors beyond stdin/stdout/stderr
     for (int fd = 3; fd < 256; fd++) {
         close(fd);
     }
-    
-    // 5. Drop capabilities
-    #ifdef HAVE_LIBCAP
-    cap_t caps = cap_init();
-    if (caps) {
-        cap_set_proc(caps);
-        cap_free(caps);
-    }
-    #endif
-    
-    // 6. TEMPORARILY DISABLE SECCOMP FOR TESTING
-    // TODO: Add more syscalls to whitelist once we identify which ones are needed
-    // install_seccomp_filter();
-    
-    fprintf(stderr, "Sandbox applied (seccomp disabled for testing)\n");
+
+    // 5. Drop all Linux capabilities and prevent privilege escalation
+    drop_capabilities();
+    log_proc_cap_status();
+
+    // 6. Seccomp is installed after model and context load via apply_post_load_seccomp()
+    fprintf(stderr, "Sandbox pre-load applied (rlimits + caps)\n");
+}
+
+void apply_post_load_seccomp(void) {
+    const char *log_env = getenv("ASSIST_SECCOMP_LOG");
+    bool log_only = (log_env != NULL && strcmp(log_env, "1") == 0);
+    install_seccomp_filter(log_only);
+    fprintf(stderr, "[sandbox] Seccomp filter enabled (%s mode)\n",
+            log_only ? "log" : "kill");
 }

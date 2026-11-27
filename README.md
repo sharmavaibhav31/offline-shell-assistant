@@ -1,156 +1,179 @@
-# 🧠 Offline AI Assistant Shell: Secure Local LLM Integration
-> A **secure, offline AI assistant** integrated directly into a custom C shell — powered by [`llama.cpp`](https://github.com/ggerganov/llama.cpp) for local inference.
+# Offline AI Assistant Shell (`myshell`)
+
+> An offline AI assistant integrated into a custom C shell (`myshell`), delegating local LLM inference to a separate worker process (`ai_worker`) over Unix pipes using [`llama.cpp`](https://github.com/ggml-org/llama.cpp).
 
 ---
 
-## 🌱 Project Story  
+## Overview
 
-Around six months ago — I began working on something similar to the Gemini CLI agent but with a different philosophy.  
+The **Offline AI Assistant Shell** separates interactive shell execution from local LLM inference across two processes:
 
-After switching to **Kali Linux**, I found even simple tasks challenging at first. Like most developers, I often relied on ChatGPT or online resources for help. Then a thought struck me:  
-
-> “If AI assistants can guide us everywhere online, why can’t one live inside the terminal itself?”  
-
-That question led me to explore how an AI model could safely assist users within a **command-line environment**. I quickly realized this came with serious risks — from **data corruption** and **privilege escalation** to **privacy breaches** and **system compromise**.  
-
-Instead of abandoning the idea, I decided to design it **responsibly**, focusing on **security-first principles**:  
-- Studying **AI agent behavior** inside operating systems  
-- Implementing **sandboxing** and **syscall filtering (Seccomp)**  
-- Ensuring **fully offline**, **local inference** for data privacy  
-
----
----
-
-## 📺 Demo Video
-
-Check out a quick demonstration of the offline AI assistant in action.
-
-[![Watch the Demo: Offline AI Assistant Shell](https://img.youtube.com/vi/nCAE7SovqPM/maxresdefault.jpg)](https://www.youtube.com/watch?v=nCAE7SovqPM)
+- **`myshell` (`mini-shell/main.c`, `mini-shell/shell.c`, `mini-shell/shell.h`)**: Interactive shell loop that runs standard commands via `fork()`/`execvp()`, spawns `ai_worker` via `fork()`/`execl()` (located next to `myshell` via `/proc/self/exe`), communicates over unidirectional pipes, reads replies until the `__ASSIST_END__` marker with bounded buffers and per-read `select()` timeouts, reports worker crashes/signals via `waitpid()` (`WIFSIGNALED`/`WTERMSIG`), and respawns the worker on the next `assist` query.
+- **`ai_worker` (`mini-shell/ai_worker.c`, `mini-shell/sandbox.c`, `mini-shell/seccomp_filter.c`)**: Runs TinyLlama-1.1B-Chat locally on CPU via `llama.cpp` (or falls back to `--echo` mode if no accessible GGUF model is present), formats queries with the TinyLlama chat template (`<|system|>...<|user|>...<|assistant|>`), clears KV cache memory between queries (`llama_memory_clear(llama_get_memory(ctx), true)`), silences `llama.cpp` logs unless `--verbose` is given, and applies OS-level process restrictions before loading the model.
 
 ---
 
-## ⚙️ Tech Stack & Security Architecture  
+## Architecture
 
-| Component | Purpose |
-|------------|----------|
-| **C** | System-level shell implementation |
-| **CMake** | Build automation |
-| **llama.cpp** | Efficient local inference on CPU |
-| **TinyLlama-1.1B-Chat** | Lightweight conversational LLM |
-| **Seccomp (Secure Computing Mode)** | Syscall filtering and sandboxing |
-
-This architecture ensures the assistant operates **entirely offline**, in a **restricted and isolated** environment — minimizing system exposure while preserving performance and privacy.
+```text
++-----------------------------------+   pipe_to_worker    +------------------------------------+
+| myshell (Parent / Trusted Shell)  | ------------------> | ai_worker (Child / Worker Process) |
+| - Command parsing & job execution |                     | - setrlimit() (AS, CPU, CORE)      |
+| - Bounded timeout pipe reads      | <------------------ | - capset() + PR_SET_NO_NEW_PRIVS   |
+| - Respawns worker & reports exits |  pipe_from_worker   | - llama.cpp inference / echo mode  |
++-----------------------------------+                     +------------------------------------+
+```
 
 ---
 
-## 🧠 How It Works  
+## Security & Isolation Status
 
-Once launched, the shell initializes a **sandboxed AI worker** that processes natural language queries locally.  
+| Mechanism | Status | Details & Verification |
+|---|---|---|
+| `rlimits` | **Working** | `sandbox.c` sets `RLIMIT_AS` (2 GiB), `RLIMIT_CPU` (600 s cumulative CPU time), and `RLIMIT_CORE` (0 bytes, disables core dumps) via `setrlimit()`. |
+| `capability dropping` | **Working** | `sandbox.c` clears effective/permitted/inheritable capabilities via `capset()` (or `libcap` when `HAVE_LIBCAP` is defined) and sets `PR_SET_NO_NEW_PRIVS = 1`. Verified via `/proc/self/status` inside `ai_worker`: `CapEff: 0000000000000000`, `CapPrm: 0000000000000000`, `NoNewPrivs: 1`. |
+| `seccomp` | **Working** | `seccomp_filter.c` installs a BPF `SECCOMP_RET_KILL_PROCESS` syscall whitelist (`install_seccomp_filter`) after `llama_init_from_model()` (and before `echo_worker()`), allowing `strace -f`-audited runtime/threading syscalls (`read`, `write`, `mmap`, `munmap`, `mprotect`, `madvise`, `brk`, `futex`, `clone3`, `clone`, `set_robust_list`, `rseq`, `rt_sig*`, `exit*`, etc.) and blocking `openat`, `execve`, `socket`, etc. Verified `Seccomp: 2` and 10/10 queries in kill mode. |
+| `namespaces` | **Not working** | `unshare(CLONE_NEWNS | CLONE_NEWPID)` fails with `EPERM` (`Operation not permitted`) when run as a normal unprivileged user without `CAP_SYS_ADMIN` or user-namespace setup. |
+| `model integrity check` | **Partial** | `mini-shell/verify_model.sh` manually checks/writes `~/.assist_ai/model.md5` with `md5sum`, but neither `myshell` nor `ai_worker` checks model hashes at startup, and MD5 is non-cryptographic. |
 
-mini-shell> assist what is recursion
-The assistant interprets your question, generates a conversational response, and displays it — without internet access or external APIs.
-Every system call is filtered through Seccomp, preventing unsafe or unauthorized operations.
+---
 
-### 🔐 Security Design
-Layer	Mechanism	Purpose   
-Seccomp	Syscall whitelist	Restrict risky system operations   
-Rlimits	Resource caps	Limit CPU & memory usage    
-Namespaces	Process & FS isolation	Contain execution context   
-Capability Dropping	Kernel privilege reduction	Prevent escalations   
+## Threat Model
 
-These combined mechanisms ensure strong process isolation, privacy, and fail-safe execution.
+- **What the worker (`ai_worker`) can do:**
+  - During startup (before post-load seccomp), read `~/.assist_ai/model.gguf`, load shared libraries, and read `/proc/self/status` as the invoking user.
+  - After model and context load, read prompts from `stdin` (pipe from `myshell`), run multi-threaded CPU inference (`clone3`/`futex`/`mmap`), and write output to `stdout` (pipe to `myshell`).
+  - Allocate up to 2 GiB of virtual address space (`RLIMIT_AS`) and consume up to 600 s of cumulative CPU time (`RLIMIT_CPU`) before termination.
+- **What the worker (`ai_worker`) cannot do:**
+  - Open new files (`openat`), spawn external programs (`execve`), or open network sockets (`socket`/`connect`) once the post-load seccomp filter is active (`Seccomp: 2`, `SECCOMP_RET_KILL_PROCESS`).
+  - Elevate privileges via setuid binaries or file capabilities (`CapEff = 0`, `PR_SET_NO_NEW_PRIVS = 1`).
+  - Produce core dumps (`RLIMIT_CORE = 0`).
+  - Execute arbitrary shell commands directly in `myshell` or hang `myshell` indefinitely (30 s `select()` timeout per read, 16 KiB reply buffer limit).
+- **What only the shell (`myshell`) controls:**
+  - Interactive prompt parsing, built-in commands (`assist`, `assist-reset`, `help`, `clear`, `exit`), and `fork()`/`execvp()` of external OS commands.
+  - Worker lifecycle management: spawning `ai_worker`, redirecting worker `stderr` to `/dev/null` (unless `--verbose`), detecting worker crashes/signals via `waitpid()`, and respawning on subsequent `assist` commands.
 
-⚡ Installation
-🧩 Prerequisites
-sudo apt-get install build-essential cmake libcap-dev valgrind  
+---
 
-1️⃣ Clone & Build llama.cpp
+## Known Limitations
 
-cd ~   
-git clone https://github.com/ggerganov/llama.cpp.git  
-cd llama.cpp  
-rm -rf build && mkdir build && cd build  
-cmake .. -DBUILD_SHARED_LIBS=OFF  
-make llama -j$(nproc)  
-  
+- **No namespace isolation for unprivileged users:** `unshare(CLONE_NEWNS | CLONE_NEWPID)` fails with `EPERM` when run as a normal user without `CAP_SYS_ADMIN` or user-namespace setup.
+- **Post-load seccomp scope:** Seccomp is installed after `llama_init_from_model()` opens the model and `/proc/self/status`, and `clone3` remains whitelisted so `llama.cpp` can spawn CPU worker threads during inference. Set `ASSIST_SECCOMP_LOG=1` to run the filter in `SECCOMP_RET_LOG` mode while debugging.
+- **Cumulative CPU limit (`RLIMIT_CPU = 600` s):** Prevents infinite runaway loops, meaning a single long-lived worker process will eventually hit the 600 s CPU cap after heavy sustained usage (after which `myshell` reports the signal and respawns a fresh worker on the next `assist` query).
+- **Single-turn stateless queries:** Context memory (`llama_memory_clear`) is cleared before every query, so `ai_worker` does not retain multi-turn conversation history across `assist` calls.
+- **Small model accuracy & context:** TinyLlama-1.1B-Chat Q4_K_M is a 1.1B parameter quantized model; answers are concise but can be factually imprecise or repetitive on complex prompts.
+- **Response size & timeout caps:** `myshell` caps each worker reply at 16,384 bytes (`AI_RESPONSE_MAX`) and times out if a single pipe read stalls for more than 30 s (`AI_TIMEOUT_SEC`).
+- **Linux-specific:** Uses `/proc/self/exe`, `/proc/self/status`, `prctl()`, `capset()`, and Linux `rlimit` semantics.
 
-2️⃣ Download Model
+---
 
-mkdir -p ~/.assist_ai  
-cd ~/.assist_ai  
-wget https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -O model.gguf  
-md5sum model.gguf > model.md5  
+## Prerequisites
 
+```bash
+sudo apt-get install build-essential cmake libcap-dev
+```
 
-3️⃣ Build the Shell
+*(Note: `libcap-dev` is optional; if absent, `sandbox.c` falls back to the Linux `SYS_capset` syscall directly.)*
 
-cd ~/Documents/C_project/mini-shell    
-mkdir build && cd build    
-cmake ..    
-make -j$(nproc)    
+---
 
+## Installation & Build
 
-💡 Usage
-Action	Command  
-Run shell	./myshell  
-Ask the AI assistant	mini-shell> assist what is recursion 
-Reset the AI worker	mini-shell> assist-reset  
-Exit the shell	mini-shell> exit  
+### 1. Clone the repository (with `llama.cpp` submodule)
 
+```bash
+git clone --recurse-submodules https://github.com/sharmavaibhav31/offline-shell-assistant.git
+cd offline-shell-assistant/mini-shell
+```
 
-🧪 Testing  
+If already cloned without submodules:
 
-| Test	| Command	 | Purpose | 
-|------------|----------|------------|
-| Run test suite	| ./test_assist.sh	| Functional testing |  
-| Verify model integrity	| ./verify_model.sh	| MD5 hash check |  
-| Stress test |	./stress_test.sh |	Load/stability validation  |
-| Security audit	| strace -f ./myshell	| Syscall inspection  |
+```bash
+git submodule update --init --recursive
+```
 
-⚠️ Troubleshooting
-| Problem	| Possible Cause | Solution |
-|------------|----------|--------------|
-| Worker fails to start	|                             Missing model file	        |                  Ensure ~/.assist_ai/model.gguf exists |
-| Timeout errors	        |                           Context too large	             |             Reduce n_ctx or use smaller model |
-| Namespace errors	       |                          Kernel limitations	            |              Fallback disables isolation |
-| Seccomp kills worker	   |                          Blocked syscall	                |            Update seccomp_filter.c whitelist |
+### 2. Download the Model
 
+```bash
+mkdir -p ~/.assist_ai
+wget https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -O ~/.assist_ai/model.gguf
+md5sum ~/.assist_ai/model.gguf > ~/.assist_ai/model.md5
+```
 
-📊 Performance (CPU-Only)
-| Metric | Value | Notes |
-|------------|----------|--------------|
-| First query | ~2–3 s | Includes model load time |
-| Subsequent queries | ~1–2 s | Reuses context |
-| Memory usage | ~1–1.5 GB | Depends on model |
-| Token speed |10–20 tokens/s | CPU-dependent |
+### 3. Build `myshell` and `ai_worker`
 
+Using the Makefile wrapper (invokes CMake):
 
-🧩 Future Scope
-This project represents an early exploration into secure, agentic AI at the system level.
-In the next phase, I aim to:
+```bash
+cd mini-shell
+make
+```
 
-🔁 Fine-tune the AI assistant for contextual awareness and adaptive command guidance  
-🧠 Transform the shell into an agentic CLI, capable of decision-making within secure bounds  
-🧩 Collaborate with mentors or security experts to enhance kernel-level safety and inference reliability  
-🔒 Explore reinforcement-based task execution within isolated sandboxes  
+Or directly with CMake (optionally passing an existing `llama.cpp` checkout via `-DLLAMA_CPP_DIR`):
 
-I believe the fusion of Machine Learning and Cybersecurity can define the next generation of secure AI agents, and this project is my step toward that direction.
+```bash
+cd mini-shell
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+# Optional external llama.cpp:
+# cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CPP_DIR=/path/to/llama.cpp
+cmake --build build -j$(nproc) --target myshell ai_worker
+```
 
-🛡️ Design Philosophy
-“Local intelligence should be private, safe, and performant.”  
-This shell demonstrates how AI inference can be embedded directly into system utilities while preserving offline privacy and integrity — valuable for embedded, defense, and research systems.  
+Both `myshell` and `ai_worker` are output into `mini-shell/build/`. `myshell` resolves `ai_worker` relative to its own binary path via `/proc/self/exe`, so it works from any working directory.
 
+---
 
-📜 License
-Licensed under the MIT License — see the LICENSE file for details.  
+## Quick Start & Usage
 
-🤝 Contributing  
-Contributions and security improvements are welcome!  
-Please open an issue before submitting major changes.  
+Run the shell:
 
-🙏 Acknowledgments  
-llama.cpp — Local LLM engine  
-TheBloke — Model provider    
-Research inspirations from secure AI sandboxing and trusted computing  
+```bash
+./mini-shell/build/myshell
+```
 
-<p align="center"><sub>🧠 Built for privacy. Designed for performance. Secured by sandboxing.</sub></p> 
+Pass `--verbose` (or `-v`) to preserve worker `stderr` and `llama.cpp` logs:
+
+```bash
+./mini-shell/build/myshell --verbose
+```
+
+If `~/.assist_ai/model.gguf` is missing, `ai_worker` falls back to echo mode (`AI: Echo: <prompt>`).
+
+| Action | Command |
+|---|---|
+| Ask the AI assistant | `mini-shell> assist what is 2+2` |
+| Multi-word prompt | `mini-shell> assist explain the difference between RAM and ROM` |
+| Restart the AI worker | `mini-shell> assist-reset` |
+| Show built-in commands | `mini-shell> help` |
+| Clear screen | `mini-shell> clear` |
+| Exit the shell | `mini-shell> exit` |
+
+---
+
+## Performance (Measured)
+
+Measured on `Intel(R) Core(TM) i3-1005G1 CPU @ 1.20GHz` (2 cores / 4 threads, `18 GiB` RAM) running `TinyLlama-1.1B-Chat-v1.0` Q4_K_M (`636.18 MiB`, `n_threads = 2`). See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for raw commands and full data.
+
+| Metric | Measured Value | Notes |
+|---|---|---|
+| Token generation (`llama-bench` `tg128`, `-t 2`) | `27.38 ± 1.08 tokens/s` | `pp128`: `86.44 ± 6.58 tokens/s` |
+| Peak memory (`/usr/bin/time -v`) | `1,186,008 KB` (~`1.13 GiB`) | Max RSS across 5 queries |
+| First query latency | `2.088 s` | Includes worker spawn, model load, and reply |
+| Subsequent query latency | `0.963 s` – `10.936 s` | Depends on reply length (up to 256 tokens) |
+
+---
+
+## Testing
+
+```bash
+cd mini-shell
+./test_assist.sh
+./stress_test.sh
+./verify_model.sh
+```
+
+---
+
+## License
+
+MIT License.

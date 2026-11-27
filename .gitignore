@@ -1,0 +1,21 @@
+# Build directories and artifacts
+build/
+mini-shell/build/
+*.o
+*.a
+*.so
+*.so.*
+*.out
+
+# Compiled binaries
+mini-shell/mini-shell
+mini-shell/myshell
+mini-shell/ai_worker
+
+# Backup and temporary files
+*.backup
+*_backup.*
+*~
+*.swp
+.DS_Store
+/tmp/
